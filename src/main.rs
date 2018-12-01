@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::io::Read;
 use std::time;
+use std::thread;
 
 fn main() {
     let config = Config::new(env::args());
@@ -17,21 +18,47 @@ fn main() {
 fn server(config: &Config) -> Result<(), io::Error> {
     loop {
         let socket = net::UdpSocket::bind((config.local_ip, config.local_port))?;
-        let mut buffer = [0; 5];
-        let (_, remote_addr) = socket.recv_from(&mut buffer)?;
-        let str = str::from_utf8(&buffer[0..4]).unwrap();
-        let len = u8::from(buffer[4]);
+
+        socket.set_read_timeout(Some(time::Duration::new(0, 30000)))?;
+
+        let mut buffer = [0; 4];
+        let remote_addr;
+        match socket.recv_from(&mut buffer) {
+            Ok((_, addr)) => {
+                remote_addr = addr;
+            }
+            Err(_) => {
+                continue;
+            }
+        }
+        let str = str::from_utf8(&buffer).unwrap();
 
         if str.eq(&"helo".to_string()) {
             socket.connect(remote_addr)?;
             let mut i = 1;
-            while i < len {
-                socket.send(&generate_response_packet(false))?;
+            loop {
+                println!("send packet no. {}", i);
+                match socket.send(&generate_response_packet(false)) {
+                    Ok(_) => {},
+                    Err(_) => break
+                };
                 i += 1;
+
+                if i % 100 == 0 {
+                    let mut res_buffer = [0; 3];
+                    match socket.recv(&mut res_buffer) {
+                        Ok(_) => {
+                            let res_str = str::from_utf8(&res_buffer).unwrap();
+                            if res_str.eq(&"bye".to_string()) {
+                                break;
+                            }
+                        },
+                        Err(_) => {}
+                    };
+                }
             }
-            let response = generate_response_packet(true);
-            socket.send(&response)?;
         }
+        println!("connection closed");
     }
 }
 
@@ -69,27 +96,20 @@ fn client(config: &Config) -> Result<(), io::Error> {
     socket.connect((config.remote_ip, config.remote_port))?;
 
     let helo = "helo".to_string().into_bytes();
-    let mut mreq: [u8; 5] = [0; 5];
-    let (left, right) = mreq.split_at_mut(4);
-    left.copy_from_slice(&helo[0..4]);
-    right[0] = config.packet_amount;
-    let req = [left, right].concat();
-    socket.send(&req)?;
+    socket.send(&helo)?;
+
+    let mut buff = [0; 2048];
+    socket.recv(&mut buff).unwrap();
 
     let download_time = time::Instant::now();
 
+    let mut packet_number = 0;
     loop {
+        packet_number += 1;
         let mut buffer = [0; 2048];
         socket.recv(&mut buffer).unwrap();
 
-        let response_str: String = buffer[0..buffer.len() - 1]
-            .into_iter()
-            .map(|c| {
-                char::from(c.clone())
-            })
-            .collect();
-
-        if buffer.ends_with(&[0]) {
+        if packet_number > config.packet_amount {
             break;
         }
     }
@@ -104,6 +124,30 @@ fn client(config: &Config) -> Result<(), io::Error> {
     let packets_per_seconds = f64::from(elapsed_ms * 1000) / f64::from(config.packet_amount);
     println!("Packets per second: {}", packets_per_seconds);
 
+    loop {
+        socket.set_read_timeout(Some(time::Duration::new(0, 30000)))?;
+        match socket.recv(&mut buff) {
+            Ok(_) => {},
+            Err(_) => break,
+        };
+    }
+
+    loop {
+        let mut buffer = [0; 1];
+        match socket.recv(&mut buffer) {
+            Ok(_) => {
+                println!("{:?}", buffer);
+                println!("telling server to stop");
+                let bye = "bye".to_string().into_bytes();
+                socket.send(&bye);
+                thread::sleep(time::Duration::new(1, 0));
+            },
+            Err(_) => {
+                break;
+            }
+        };
+    }
+
     Ok(())
 }
 
@@ -114,47 +158,56 @@ enum Mode {
 
 struct Config {
     mode: Mode,
-    packet_amount: u8,
-    remote_ip: net::Ipv6Addr,
+    packet_amount: u32,
+    remote_ip: net::Ipv4Addr,
     remote_port: u16,
-    local_ip: net::Ipv6Addr,
+    local_ip: net::Ipv4Addr,
     local_port: u16,
 }
 
 impl Config {
     fn new(mut args: env::Args) -> Config {
         let raw_mode = args.nth(1).unwrap();
-        let opt_packet_amount = args.nth(0);
 
         let mode;
         let remote_port;
-        let mut remote_ip = "::1".parse().unwrap();
+        let mut remote_ip = "127.0.0.1".parse().unwrap();
+        let mut packet_amount = 0;
+        let local_ip;
         let local_port;
+
+        local_ip = match args.nth(0) {
+            Some(ip) => ip.parse().unwrap(),
+            None => "127.0.0.1".parse().unwrap()
+        };
+
         if "server".eq(&raw_mode) {
             mode = Mode::Server;
             local_port = 1234;
             remote_port = 1235;
         } else if "client".eq(&raw_mode) {
-            let opt_remote_ip = args.nth(0);
-            println!("{:?}", args);
             mode = Mode::Client;
             local_port = 1235;
             remote_port = 1234;
-            remote_ip = opt_remote_ip.unwrap().parse().unwrap();
+
+            match args.nth(0) {
+                Some(ip) => remote_ip = ip.parse().unwrap(),
+                None => {}
+            };
+
+            packet_amount = match args.nth(0) {
+                Some(n) => n.parse().unwrap(),
+                None => 255,
+            };
         } else {
             panic!("Unsupported mode");
         }
-
-        let packet_amount = match opt_packet_amount {
-            Some(n) => n.parse().unwrap(),
-            None => u8::from(255),
-        };
 
         Config {
             mode,
             packet_amount,
             remote_ip,
-            local_ip: "::1".parse().unwrap(),
+            local_ip,
             remote_port,
             local_port,
         }
