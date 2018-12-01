@@ -1,0 +1,9 @@
+version: "3"
+
+services:
+  ping-pong:
+    build:
+      context: .
+    ports:
+      - "1234/udp"
+
