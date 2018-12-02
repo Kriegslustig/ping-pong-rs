@@ -11,32 +11,41 @@ fn main() {
     let config = Config::new(env::args());
     match config.mode {
         Mode::Client => client(&config).unwrap(),
-        Mode::Server => server(&config).unwrap()
+        Mode::Server => {
+            loop {
+                match server(&config) {
+                    Ok(_) => continue,
+                    Err(err) => {
+                        println!("Error: {}", err);
+                        println!("Server died. Restarting.");
+                        continue
+                    }
+                }
+            }
+        }
     };
 }
 
-fn server(config: &Config) -> Result<(), io::Error> {
+fn server(config: &Config) -> Result<(), String> {
     loop {
-        let socket = net::UdpSocket::bind((config.local_ip, config.local_port))?;
-
-        socket.set_read_timeout(Some(time::Duration::new(0, 30000)))?;
+        let socket = net::UdpSocket::bind((config.local_ip, config.local_port))
+            .map_err(|_| "Unable to bind to socket".to_string())?;
 
         let mut buffer = [0; 4];
-        let remote_addr;
-        match socket.recv_from(&mut buffer) {
-            Ok((_, addr)) => {
-                remote_addr = addr;
-            }
-            Err(_) => {
-                continue;
-            }
-        }
-        let str = str::from_utf8(&buffer).unwrap();
+        let (_, remote_addr) = socket.recv_from(&mut buffer)
+            .map_err(|_| "Unable to get packet".to_string())?;
+
+        let str = str::from_utf8(&buffer)
+            .map_err(|_| "Unable to parse request".to_string())?;
 
         if str.eq(&"helo".to_string()) {
-            socket.connect(remote_addr)?;
+            socket.connect(remote_addr)
+                .map_err(|_| "Unable to connect to remote".to_string())?;
             let mut i = 1;
             loop {
+                socket.set_read_timeout(Some(time::Duration::new(0, 30000)))
+                    .map_err(|_| "Unable to set read timeout".to_string())?;
+
                 println!("send packet no. {}", i);
                 match socket.send(&generate_response_packet(false)) {
                     Ok(_) => {},
@@ -48,7 +57,8 @@ fn server(config: &Config) -> Result<(), io::Error> {
                     let mut res_buffer = [0; 3];
                     match socket.recv(&mut res_buffer) {
                         Ok(_) => {
-                            let res_str = str::from_utf8(&res_buffer).unwrap();
+                            let res_str = str::from_utf8(&res_buffer)
+                                .map_err(|_| "Unable to read packet".to_string())?;
                             if res_str.eq(&"bye".to_string()) {
                                 break;
                             }
